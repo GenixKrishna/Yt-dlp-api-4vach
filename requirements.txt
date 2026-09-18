@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+yt-dlp[default]
+pydantic
+bgutil-ytdlp-pot-provider==2.0.0
