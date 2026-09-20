@@ -10,7 +10,7 @@ from pydantic import BaseModel, HttpUrl
 
 app = FastAPI(
     title="VaCh yt-dlp + FFmpeg API",
-    version="2.2.1",
+    version="2.2.2",
 )
 
 app.add_middleware(
@@ -29,24 +29,51 @@ class MediaRequest(BaseModel):
 
 
 def base_ydl_opts() -> dict:
+    # Shared configuration. The PO-token provider is installed/running
+    # inside the Railway container on 127.0.0.1:4416.
     return {
         "quiet": True,
-        "no_warnings": True,
+        "no_warnings": False,
         "js_runtimes": {"node": {}},
         "remote_components": {"ejs": ["github"]},
+
         "extractor_args": {
             "youtubepot-bgutilhttp": {
-                "base_url": "http://127.0.0.1:4416"
+                "base_url": "http://127.0.0.1:4416",
             },
             "youtube": {
                 "player_client": ["mweb"],
-                "formats": ["missing_pot"],
+                "fetch_pot": "always",
+                "pot_trace": "true",
             },
         },
+
         "retries": 3,
-        "fragment_retries": 3,
+        "fragment_retries": 5,
         "noplaylist": True,
     }
+
+
+def info_ydl_opts() -> dict:
+    opts = base_ydl_opts()
+
+    # For /info, expose formats that are marked MISSING POT so the
+    # frontend can see the complete resolution range. Downloading
+    # still uses a separate configuration and forces POT fetching.
+    opts["extractor_args"]["youtube"]["formats"] = ["missing_pot"]
+    opts["skip_download"] = True
+
+    return opts
+
+
+def download_ydl_opts() -> dict:
+    opts = base_ydl_opts()
+
+    # IMPORTANT:
+    # Do not force "formats=missing_pot" for actual downloads.
+    # Those formats may be listed for discovery but can return HTTP 403
+    # if a valid GVS PO token is not attached.
+    return opts
 
 
 @app.get("/")
@@ -54,22 +81,25 @@ def health():
     return {
         "status": "online",
         "service": "yt-dlp + FFmpeg API",
-        "version": "2.2.1",
+        "version": "2.2.2",
         "youtube_js_runtime": "node",
         "youtube_ejs": True,
         "youtube_po_token_provider": "bgutil-http",
         "youtube_player_client": "mweb",
+        "youtube_fetch_pot": "always",
     }
 
 
 @app.post("/info")
 def get_info(request: MediaRequest):
-    opts = base_ydl_opts()
-    opts["skip_download"] = True
+    opts = info_ydl_opts()
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(str(request.url), download=False)
+            info = ydl.extract_info(
+                str(request.url),
+                download=False,
+            )
 
         formats = []
 
@@ -93,7 +123,10 @@ def get_info(request: MediaRequest):
                 "height": height,
                 "width": f.get("width"),
                 "fps": f.get("fps"),
-                "filesize": f.get("filesize") or f.get("filesize_approx"),
+                "filesize": (
+                    f.get("filesize")
+                    or f.get("filesize_approx")
+                ),
                 "vcodec": vcodec,
                 "acodec": f.get("acodec"),
                 "format_note": f.get("format_note"),
@@ -109,6 +142,7 @@ def get_info(request: MediaRequest):
                 item["vcodec"],
                 item["acodec"],
             )
+
             if key not in seen:
                 seen.add(key)
                 unique_formats.append(item)
@@ -138,10 +172,16 @@ def get_info(request: MediaRequest):
 
 @app.post("/download")
 def download_media(request: MediaRequest):
-    temp_dir = Path(tempfile.mkdtemp(prefix="vach_"))
-    output_template = str(temp_dir / "%(title).150s.%(ext)s")
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix="vach_")
+    )
 
-    opts = base_ydl_opts()
+    output_template = str(
+        temp_dir / "%(title).150s.%(ext)s"
+    )
+
+    opts = download_ydl_opts()
+
     opts.update({
         "outtmpl": output_template,
         "restrictfilenames": True,
@@ -156,17 +196,25 @@ def download_media(request: MediaRequest):
                 "preferredquality": "192",
             }],
         })
+
     else:
-        quality = str(request.quality).lower().strip()
+        quality = str(
+            request.quality
+        ).lower().strip()
 
         if quality.isdigit():
             height = int(quality)
+
+            # Prefer the requested resolution or the closest lower
+            # real video stream, then merge the best audio.
             opts["format"] = (
                 f"bestvideo[height<={height}]+bestaudio/"
                 f"best[height<={height}]/best"
             )
         else:
-            opts["format"] = "bestvideo+bestaudio/best"
+            opts["format"] = (
+                "bestvideo+bestaudio/best"
+            )
 
         opts["merge_output_format"] = "mp4"
 
@@ -179,15 +227,23 @@ def download_media(request: MediaRequest):
             ydl.prepare_filename(info)
 
         if request.audio_only:
-            candidates = list(temp_dir.glob("*"))
+            candidates = list(
+                temp_dir.glob("*")
+            )
         else:
-            candidates = list(temp_dir.glob("*.mp4"))
+            candidates = list(
+                temp_dir.glob("*.mp4")
+            )
 
         if not candidates:
-            candidates = list(temp_dir.glob("*"))
+            candidates = list(
+                temp_dir.glob("*")
+            )
 
         if not candidates:
-            raise RuntimeError("Downloaded file was not created.")
+            raise RuntimeError(
+                "Downloaded file was not created."
+            )
 
         file_path = max(
             candidates,
@@ -208,7 +264,11 @@ def download_media(request: MediaRequest):
         )
 
     except Exception as exc:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(
+            temp_dir,
+            ignore_errors=True,
+        )
+
         raise HTTPException(
             status_code=400,
             detail=f"ERROR: {exc}",
