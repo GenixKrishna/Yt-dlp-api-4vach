@@ -8,10 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 
+
 app = FastAPI(
     title="VaCh yt-dlp + FFmpeg API",
-    version="2.2.2",
+    version="2.2.3",
 )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,11 +31,14 @@ class MediaRequest(BaseModel):
 
 
 def base_ydl_opts() -> dict:
-    # Shared configuration. The PO-token provider is installed/running
-    # inside the Railway container on 127.0.0.1:4416.
+    # Shared configuration.
+    # The PO-token provider is installed/running inside the
+    # Railway container on 127.0.0.1:4416.
     return {
         "quiet": True,
         "no_warnings": False,
+
+        # YouTube JS challenge support.
         "js_runtimes": {"node": {}},
         "remote_components": {"ejs": ["github"]},
 
@@ -43,6 +48,8 @@ def base_ydl_opts() -> dict:
             },
             "youtube": {
                 "player_client": ["mweb"],
+
+                # Always request a PO token.
                 "fetch_pot": "always",
                 "pot_trace": "true",
             },
@@ -57,9 +64,8 @@ def base_ydl_opts() -> dict:
 def info_ydl_opts() -> dict:
     opts = base_ydl_opts()
 
-    # For /info, expose formats that are marked MISSING POT so the
-    # frontend can see the complete resolution range. Downloading
-    # still uses a separate configuration and forces POT fetching.
+    # Show formats which may be marked as missing POT so that
+    # /info can expose the complete resolution range.
     opts["extractor_args"]["youtube"]["formats"] = ["missing_pot"]
     opts["skip_download"] = True
 
@@ -70,9 +76,15 @@ def download_ydl_opts() -> dict:
     opts = base_ydl_opts()
 
     # IMPORTANT:
-    # Do not force "formats=missing_pot" for actual downloads.
-    # Those formats may be listed for discovery but can return HTTP 403
-    # if a valid GVS PO token is not attached.
+    # Allow yt-dlp to use formats that are marked "missing_pot".
+    # bgutil-http is configured above to obtain the required
+    # YouTube PO token from the local provider.
+    #
+    # Without this, high-resolution formats can be visible in
+    # /info but be excluded from the actual download selection,
+    # causing yt-dlp to fall back to a low-resolution stream.
+    opts["extractor_args"]["youtube"]["formats"] = ["missing_pot"]
+
     return opts
 
 
@@ -81,12 +93,13 @@ def health():
     return {
         "status": "online",
         "service": "yt-dlp + FFmpeg API",
-        "version": "2.2.2",
+        "version": "2.2.3",
         "youtube_js_runtime": "node",
         "youtube_ejs": True,
         "youtube_po_token_provider": "bgutil-http",
         "youtube_player_client": "mweb",
         "youtube_fetch_pot": "always",
+        "youtube_missing_pot_formats": True,
     }
 
 
@@ -110,10 +123,13 @@ def get_info(request: MediaRequest):
 
             if not height:
                 continue
+
             if not vcodec or vcodec == "none":
                 continue
+
             if ext == "mhtml":
                 continue
+
             if f.get("format_note") == "storyboard":
                 continue
 
@@ -132,6 +148,8 @@ def get_info(request: MediaRequest):
                 "format_note": f.get("format_note"),
             })
 
+        # Remove duplicate display entries while preserving
+        # different video/audio combinations.
         seen = set()
         unique_formats = []
 
@@ -170,6 +188,38 @@ def get_info(request: MediaRequest):
         ) from exc
 
 
+def build_video_format(quality: str) -> str:
+    """
+    Build a video selector which prefers the requested resolution
+    or the closest lower resolution.
+
+    IMPORTANT:
+    We intentionally do NOT include:
+        best[height<=...]
+    or:
+        /best
+
+    Those combined-stream fallbacks can cause yt-dlp to select a
+    low-resolution stream such as 360p when a separate high-resolution
+    video stream is available.
+    """
+
+    quality = str(quality).lower().strip()
+
+    if quality.isdigit():
+        height = int(quality)
+
+        if height <= 0:
+            raise ValueError("Quality must be a positive height.")
+
+        return (
+            f"bestvideo[height<={height}]+bestaudio/"
+            f"bestvideo[height<={height}]"
+        )
+
+    return "bestvideo+bestaudio/bestvideo"
+
+
 @app.post("/download")
 def download_media(request: MediaRequest):
     temp_dir = Path(
@@ -198,24 +248,23 @@ def download_media(request: MediaRequest):
         })
 
     else:
-        quality = str(
-            request.quality
-        ).lower().strip()
-
-        if quality.isdigit():
-            height = int(quality)
-
-            # Prefer the requested resolution or the closest lower
-            # real video stream, then merge the best audio.
-            opts["format"] = (
-                f"bestvideo[height<={height}]+bestaudio/"
-                f"best[height<={height}]/best"
+        try:
+            opts["format"] = build_video_format(
+                request.quality
             )
-        else:
-            opts["format"] = (
-                "bestvideo+bestaudio/best"
+        except ValueError as exc:
+            shutil.rmtree(
+                temp_dir,
+                ignore_errors=True,
             )
 
+            raise HTTPException(
+                status_code=400,
+                detail=f"ERROR: {exc}",
+            ) from exc
+
+        # Always produce MP4 when FFmpeg can merge the
+        # separate video and audio streams.
         opts["merge_output_format"] = "mp4"
 
     try:
@@ -224,6 +273,7 @@ def download_media(request: MediaRequest):
                 str(request.url),
                 download=True,
             )
+
             ydl.prepare_filename(info)
 
         if request.audio_only:
